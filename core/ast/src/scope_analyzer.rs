@@ -456,7 +456,9 @@ impl<'ast> VisitorMut<'ast> for BindingEscapeAnalyzer<'_> {
             ClassElement::PrivateFieldDefinition(field)
             | ClassElement::PrivateStaticFieldDefinition(field) => {
                 if let Some(e) = &mut field.initializer {
+                    std::mem::swap(&mut self.scope, &mut field.scope);
                     self.visit_expression_mut(e)?;
+                    std::mem::swap(&mut self.scope, &mut field.scope);
                 }
                 ControlFlow::Continue(())
             }
@@ -1228,6 +1230,30 @@ where
         index: scope.scope_index(),
     };
     let _ = visitor.visit(node.into());
+}
+
+/// Like [`optimize_scope_indices`] but for a [`FunctionExpression`] compiled
+/// by the `Function` constructor with `force_function_scope = true`.
+///
+/// The `Function` constructor always pushes a function scope at runtime, so
+/// the optimizer must account for that even when the function scope would
+/// otherwise be elided.
+pub(crate) fn optimize_scope_indices_function_constructor(
+    node: &mut FunctionExpression,
+    scope: &Scope,
+) {
+    let mut visitor = ScopeIndexVisitor {
+        index: scope.scope_index(),
+    };
+    let _ = visitor.visit_function_like(
+        &mut node.body,
+        &mut node.parameters,
+        &mut node.scopes,
+        &mut node.name_scope,
+        false,
+        // Always force the function scope for the Function constructor.
+        true,
+    );
 }
 
 struct ScopeIndexVisitor {
@@ -2229,6 +2255,18 @@ fn module_instantiation(module: &Module, env: &Scope, interner: &Interner) {
                     drop(env.create_mutable_binding(name, false));
                 }
             }
+            LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::Using(u)) => {
+                for name in bound_names(u) {
+                    let name = name.to_js_string(interner);
+                    drop(env.create_mutable_binding(name, false));
+                }
+            }
+            LexicallyScopedDeclaration::LexicalDeclaration(LexicalDeclaration::AwaitUsing(au)) => {
+                for name in bound_names(au) {
+                    let name = name.to_js_string(interner);
+                    drop(env.create_mutable_binding(name, false));
+                }
+            }
             LexicallyScopedDeclaration::AssignmentExpression(expr) => {
                 for name in bound_names(expr) {
                     let name = name.to_js_string(interner);
@@ -2300,7 +2338,7 @@ pub(crate) fn eval_declaration_instantiation_scope(
         }
 
         // b. Let thisEnv be lexEnv.
-        let mut this_env = lex_env.clone();
+        let mut this_env = lex_env;
 
         // c. Assert: The following loop will terminate.
         // d. Repeat, while thisEnv is not varEnv,

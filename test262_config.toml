@@ -1,4 +1,4 @@
-commit = "7d0f906f4bef32bad3d6cce30c53978e26d8d10c"
+commit = "72ec758c9b6351b5baa299e0a162c2b7fe497cc6"
 
 [ignored]
 # Not implemented yet:
@@ -7,19 +7,20 @@ flags = []
 features = [
     ### Unimplemented features:
 
-    "FinalizationRegistry",
-    "IsHTMLDDA",
     "symbols-as-weakmap-keys",
     "Intl.DisplayNames",
     "Intl.RelativeTimeFormat",
     "Intl-enumeration",
     "Intl.DurationFormat",
     "regexp-duplicate-named-groups",
-    "iterator-helpers",
     "explicit-resource-management",
     "joint-iteration",
 
     ### Pending proposals
+
+    # https://github.com/tc39/proposal-import-bytes
+    "import-bytes",
+
 
     # https://github.com/tc39/proposal-intl-locale-info
     "Intl.Locale-info",
@@ -33,35 +34,23 @@ features = [
     # https://github.com/tc39/proposal-defer-import-eval
     "import-defer",
 
-    # https://github.com/tc39/proposal-iterator-sequencing
-    "iterator-sequencing",
-
     # https://github.com/tc39/proposal-realms
     "ShadowRealm",
 
     # https://github.com/tc39/proposal-decorators
     "decorators",
 
-    # https://github.com/tc39/proposal-json-parse-with-source
-    "json-parse-with-source",
-
     # Uint8Array Base64
     # https://github.com/tc39/proposal-arraybuffer-base64
     "uint8array-base64",
 
     # Source Phase Imports
-    # https://github.com/tc39/proposal-source-phase-imports
-    "source-phase-imports",
     # test262 special specifier
     "source-phase-imports-module-source",
 
     # Immutable Array Buffer
     # https://github.com/tc39/proposal-immutable-arraybuffer
     "immutable-arraybuffer",
-
-    # Non-extensible Applies to Private
-    # https://github.com/tc39/proposal-nonextensible-applies-to-private
-    "nonextensible-applies-to-private",
 
     ### Non-standard
     "caller",
@@ -71,7 +60,6 @@ tests = [
     # Should throw an OOM error instead of filling the whole RAM.
     "test/staging/sm/String/replace-math.js",
     # Panics
-    "test/staging/sm/expressions/optional-chain-first-expression.js",
     "test/staging/sm/regress/regress-554955-2.js",
     "test/staging/sm/class/fields-static-class-name-binding-eval.js",
     "test/staging/sm/regress/regress-554955-1.js",
@@ -94,4 +82,16 @@ tests = [
     "test/intl402/Locale/prototype/calendar/canonicalize.js",
     "test/intl402/Locale/constructor-non-iana-canon.js",
     "test/intl402/Locale/constructor-options-canonicalized.js",
+    # TODO: Remove this once regress fixes the named groups parsing issue.
+    "test/built-ins/RegExp/named-groups/non-unicode-property-names-valid.js",
+    # Source Phase Imports: AbstractModuleSource built-in and static `import source` not yet implemented.
+    "test/built-ins/AbstractModuleSource/proto.js",
+    "test/built-ins/AbstractModuleSource/name.js",
+    "test/built-ins/AbstractModuleSource/length.js",
+    "test/built-ins/AbstractModuleSource/prototype/proto.js",
+    "test/built-ins/AbstractModuleSource/prototype/Symbol.toStringTag.js",
+    "test/built-ins/AbstractModuleSource/prototype/constructor.js",
+    "test/built-ins/AbstractModuleSource/prototype.js",
+    "test/built-ins/AbstractModuleSource/throw-from-constructor.js",
+    "test/language/module-code/source-phase-import/import-source.js",
 ]

@@ -1,5 +1,8 @@
 //! Error-related types and conversions.
 
+#[cfg(test)]
+mod tests;
+
 use crate::{
     Context, JsResult, JsString, JsValue,
     builtins::{
@@ -199,9 +202,8 @@ macro_rules! js_error {
 ///     .with_cause(cause)
 ///     .into();
 ///
-/// assert!(native_error.as_native().is_some());
-///
-/// let kind = &native_error.as_native().unwrap().kind;
+/// let native = native_error.as_native().unwrap();
+/// let kind = native.kind();
 /// assert!(matches!(kind, JsNativeErrorKind::Type));
 /// ```
 #[derive(Debug, Clone, Trace, Finalize)]
@@ -319,9 +321,50 @@ pub enum RuntimeLimitError {
     StackSize,
 }
 
+/// Internal panic error.
+#[derive(Debug, Clone, Error, Eq, PartialEq, Trace, Finalize)]
+#[boa_gc(unsafe_no_drop)]
+#[error("{message}")]
+#[must_use]
+pub struct PanicError {
+    /// The original panic message providing context about what went wrong.
+    message: Box<str>,
+    /// The source error of this panic, if applicable.
+    source: Option<Box<JsError>>,
+}
+
+impl PanicError {
+    /// Creates a `PanicError` error from a panic message.
+    pub fn new<S: Into<Box<str>>>(message: S) -> Self {
+        PanicError {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// Sets the source error of this `PanicError`.
+    pub fn with_source<E: Into<JsError>>(mut self, source: E) -> Self {
+        self.source = Some(Box::new(source.into()));
+        self
+    }
+
+    /// Gets the message of this `PanicError`.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl From<PanicError> for JsError {
+    fn from(err: PanicError) -> Self {
+        EngineError::from(err).into()
+    }
+}
+
 /// Engine error that cannot be caught from within ECMAScript code.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Error, Trace, Finalize)]
-#[boa_gc(empty_trace)]
+#[derive(Debug, Clone, Error, Eq, PartialEq, Trace, Finalize)]
+#[boa_gc(unsafe_no_drop)]
+#[allow(variant_size_differences)]
 pub enum EngineError {
     /// Error thrown when no instructions remain. Only used in a fuzzing context.
     #[cfg(feature = "fuzz")]
@@ -331,6 +374,29 @@ pub enum EngineError {
     /// Error thrown when a runtime limit is exceeded.
     #[error("RuntimeLimitError: {0}")]
     RuntimeLimit(#[from] RuntimeLimitError),
+
+    /// Error thrown when an internal panic condition is encountered.
+    #[error("EnginePanic: {0}")]
+    Panic(#[from] PanicError),
+}
+
+impl EngineError {
+    /// Converts this error into its thread-safe, erased version.
+    ///
+    /// Even though this operation is lossy, converting into an `ErasedEngineError`
+    /// is useful since it implements `Send` and `Sync`, making it compatible with
+    /// error reporting frameworks such as `anyhow`, `eyre` or `miette`.
+    fn into_erased(self, context: &mut Context) -> ErasedEngineError {
+        match self {
+            #[cfg(feature = "fuzz")]
+            EngineError::NoInstructionsRemain => ErasedEngineError::NoInstructionsRemain,
+            EngineError::RuntimeLimit(err) => ErasedEngineError::RuntimeLimit(err),
+            EngineError::Panic(err) => ErasedEngineError::Panic(ErasedPanicError {
+                message: err.message,
+                source: err.source.map(|err| Box::new(err.into_erased(context))),
+            }),
+        }
+    }
 }
 
 impl JsError {
@@ -386,10 +452,16 @@ impl JsError {
     /// assert!(error.as_opaque().is_some());
     /// ```
     #[must_use]
-    pub const fn from_opaque(value: JsValue) -> Self {
+    pub fn from_opaque(value: JsValue) -> Self {
+        // Recover the backtrace from the Error object if present,
+        // so it survives the JsError → JsValue → JsError round-trip.
+        let backtrace = value.as_object().and_then(|obj| {
+            let error = obj.downcast_ref::<Error>()?;
+            error.backtrace.0.clone()
+        });
         Self {
             inner: Repr::Opaque(value),
-            backtrace: None,
+            backtrace,
         }
     }
 
@@ -421,8 +493,30 @@ impl JsError {
     /// ```
     pub fn into_opaque(self, context: &mut Context) -> JsResult<JsValue> {
         match self.inner {
-            Repr::Native(e) => Ok(e.into_opaque(context).into()),
-            Repr::Opaque(v) => Ok(v.clone()),
+            Repr::Native(e) => {
+                let obj = e.into_opaque(context);
+                // Store the backtrace in the Error object so it survives the
+                // JsError → JsValue → JsError round-trip through promise
+                // rejection.
+                if let Some(backtrace) = self.backtrace
+                    && let Some(mut error) = obj.downcast_mut::<Error>()
+                {
+                    error.backtrace = IgnoreEq(Some(backtrace));
+                }
+                Ok(obj.into())
+            }
+            Repr::Opaque(v) => {
+                // Store the backtrace in the Error object for opaque errors
+                // too (e.g. explicit `throw new Error(...)`).
+                if let Some(backtrace) = self.backtrace
+                    && let Some(obj) = v.as_object()
+                    && let Some(mut error) = obj.downcast_mut::<Error>()
+                    && error.backtrace.0.is_none()
+                {
+                    error.backtrace = IgnoreEq(Some(backtrace));
+                }
+                Ok(v.clone())
+            }
             Repr::Engine(_) => Err(self),
         }
     }
@@ -462,12 +556,12 @@ impl JsError {
     /// // then, try to recover the original
     /// let error = JsError::from_opaque(error_val).try_native(context).unwrap();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Type));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Type));
     /// assert_eq!(error.message(), "type error!");
     /// ```
     pub fn try_native(&self, context: &mut Context) -> Result<JsNativeError, TryNativeError> {
         match &self.inner {
-            Repr::Engine(e) => Err(TryNativeError::EngineError { source: *e }),
+            Repr::Engine(e) => Err(TryNativeError::EngineError { source: e.clone() }),
             Repr::Native(e) => Ok(e.as_ref().clone()),
             Repr::Opaque(val) => {
                 let obj = val
@@ -528,6 +622,7 @@ impl JsError {
                                         source: e,
                                     }
                                 })?;
+                                error_list.reserve(length as usize);
                                 for i in 0..length {
                                     error_list.push(Self::from_opaque(
                                         errors.get(i, context).map_err(|e| {
@@ -613,7 +708,7 @@ impl JsError {
         }
     }
 
-    /// Gets the inner [`JsNativeError`] if the error is an engine
+    /// Gets the inner [`EngineError`] if the error is an engine
     /// error, or `None` otherwise.
     #[must_use]
     pub const fn as_engine(&self) -> Option<&EngineError> {
@@ -658,7 +753,7 @@ impl JsError {
             Ok(native) => native,
             Err(TryNativeError::EngineError { source }) => {
                 return JsErasedError {
-                    inner: ErasedRepr::Engine(source),
+                    inner: ErasedRepr::Engine(source.into_erased(context)),
                 };
             }
             Err(_) => {
@@ -856,7 +951,7 @@ impl<T> From<T> for IgnoreEq<T> {
 /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
 /// let native_error = JsNativeError::uri().with_message("cannot decode uri");
 ///
-/// match native_error.kind {
+/// match native_error.kind() {
 ///     JsNativeErrorKind::Uri => { /* handle URI error*/ }
 ///     _ => unreachable!(),
 /// }
@@ -866,7 +961,7 @@ impl<T> From<T> for IgnoreEq<T> {
 #[derive(Clone, Finalize, Error, PartialEq, Eq)]
 pub struct JsNativeError {
     /// The kind of native error (e.g. `TypeError`, `SyntaxError`, etc.)
-    pub kind: JsNativeErrorKind,
+    kind: JsNativeErrorKind,
     message: Cow<'static, str>,
     #[source]
     cause: Option<Box<JsError>>,
@@ -928,6 +1023,13 @@ impl JsNativeError {
     /// Default `UriError` kind `JsNativeError`.
     pub const URI: Self = Self::uri();
 
+    /// Returns the kind of this native error.
+    #[must_use]
+    #[inline]
+    pub const fn kind(&self) -> &JsNativeErrorKind {
+        &self.kind
+    }
+
     /// Creates a new `JsNativeError` from its `kind`, `message` and (optionally) its `cause`.
     #[cfg_attr(feature = "native-backtrace", track_caller)]
     const fn new(
@@ -966,8 +1068,8 @@ impl JsNativeError {
     /// let error = JsNativeError::aggregate(inner_errors);
     ///
     /// assert!(matches!(
-    ///     error.kind,
-    ///     JsNativeErrorKind::Aggregate(ref errors) if errors.len() == 2
+    ///     error.kind(),
+    ///     JsNativeErrorKind::Aggregate(errors) if errors.len() == 2
     /// ));
     /// ```
     #[must_use]
@@ -996,7 +1098,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::error();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Error));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Error));
     /// ```
     #[must_use]
     #[inline]
@@ -1020,7 +1122,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::eval();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Eval));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Eval));
     /// ```
     #[must_use]
     #[inline]
@@ -1044,7 +1146,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::range();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Range));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Range));
     /// ```
     #[must_use]
     #[inline]
@@ -1068,7 +1170,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::reference();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Reference));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Reference));
     /// ```
     #[must_use]
     #[inline]
@@ -1092,7 +1194,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::syntax();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Syntax));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Syntax));
     /// ```
     #[must_use]
     #[inline]
@@ -1116,7 +1218,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::typ();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Type));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Type));
     /// ```
     #[must_use]
     #[inline]
@@ -1140,7 +1242,7 @@ impl JsNativeError {
     /// # use boa_engine::{JsNativeError, JsNativeErrorKind};
     /// let error = JsNativeError::uri();
     ///
-    /// assert!(matches!(error.kind, JsNativeErrorKind::Uri));
+    /// assert!(matches!(error.kind(), JsNativeErrorKind::Uri));
     /// ```
     #[must_use]
     #[inline]
@@ -1187,6 +1289,10 @@ impl JsNativeError {
     ///
     /// assert!(error.cause().unwrap().as_native().is_some());
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cause` is an uncatchable error (i.e. an engine error).
     #[must_use]
     #[inline]
     pub fn with_cause<V>(mut self, cause: V) -> Self
@@ -1495,6 +1601,57 @@ impl fmt::Display for JsNativeErrorKind {
     }
 }
 
+/// Erased version of [`PanicError`].
+///
+/// This is mainly useful to convert a `PanicError` into an `ErasedPanicError` that also
+/// implements `Send + Sync`, which makes it compatible with error reporting tools
+/// such as `anyhow`, `eyre` or `miette`.
+///
+/// Generally, the conversion from `PanicError` to `ErasedPanicError` is unidirectional,
+/// since any `JsError` that is a [`JsValue`] is converted to its string representation
+/// instead. This will lose information if that value was an object, a symbol or a big int.
+#[derive(Debug, Clone, Error, Eq, PartialEq, Trace, Finalize)]
+#[error("{message}")]
+#[must_use]
+pub struct ErasedPanicError {
+    message: Box<str>,
+    source: Option<Box<JsErasedError>>,
+}
+
+impl ErasedPanicError {
+    /// Gets the message of this `ErasedPanicError`.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+/// Erased version of [`EngineError`].
+///
+/// This is mainly useful to convert an `EngineError` into an `ErasedEngineError` that also
+/// implements `Send + Sync`, which makes it compatible with error reporting tools
+/// such as `anyhow`, `eyre` or `miette`.
+///
+/// Generally, the conversion from `EngineError` to `ErasedEngineError` is unidirectional,
+/// since any `JsError` that is a [`JsValue`] is converted to its string representation
+/// instead. This will lose information if that value was an object, a symbol or a big int.
+#[derive(Debug, Clone, Error, Eq, PartialEq, Trace, Finalize)]
+#[allow(variant_size_differences)]
+pub enum ErasedEngineError {
+    /// Error thrown when no instructions remain. Only used in a fuzzing context.
+    #[cfg(feature = "fuzz")]
+    #[error("NoInstructionsRemainError: instruction budget was exhausted")]
+    NoInstructionsRemain,
+
+    /// Error thrown when a runtime limit is exceeded.
+    #[error("RuntimeLimitError: {0}")]
+    RuntimeLimit(#[from] RuntimeLimitError),
+
+    /// Error thrown when an internal panic condition is encountered.
+    #[error("EnginePanic: {0}")]
+    Panic(#[from] ErasedPanicError),
+}
+
 /// Erased version of [`JsError`].
 ///
 /// This is mainly useful to convert a `JsError` into an `Error` that also
@@ -1513,7 +1670,7 @@ pub struct JsErasedError {
 enum ErasedRepr {
     Native(JsErasedNativeError),
     Opaque(Cow<'static, str>),
-    Engine(EngineError),
+    Engine(ErasedEngineError),
 }
 
 impl fmt::Display for JsErasedError {
@@ -1557,10 +1714,10 @@ impl JsErasedError {
         }
     }
 
-    /// Gets the inner [`EngineError`] if the error is an engine
+    /// Gets the inner [`ErasedEngineError`] if the error is an engine
     /// error, or `None` otherwise.
     #[must_use]
-    pub const fn as_engine(&self) -> Option<&EngineError> {
+    pub const fn as_engine(&self) -> Option<&ErasedEngineError> {
         match &self.inner {
             ErasedRepr::Engine(e) => Some(e),
             ErasedRepr::Opaque(_) | ErasedRepr::Native(_) => None,
